@@ -10,9 +10,9 @@ app = Flask(__name__)
 
 # InfluxDB configuration from environment variables
 token = os.getenv("INFLUXDB_TOKEN", "default-token")  
-org = os.getenv("INFLUXDB_ORG", "default_org")  
+org = os.getenv("INFLUXDB_ORG", "default_org")       
 bucket = os.getenv("INFLUXDB_BUCKET", "default_bucket")  
-influx_url = os.getenv("INFLUXDB_URL", "http://localhost:8086")  # Use default for local setup
+influx_url = os.getenv("INFLUXDB_URL", "http://localhost:8086")  
 
 # Initialize InfluxDB client
 client = InfluxDBClient(url=influx_url, token=token)
@@ -21,13 +21,18 @@ write_api = client.write_api(write_options=SYNCHRONOUS)
 # Helper function to write data into InfluxDB
 def write_to_influxdb(machine_id, attribute, value, domain="sensor"):
     try:
-        # Remove 'emeter-' prefix if it exists
-        if machine_id.startswith("emeter-"):
-            machine_id = machine_id[7:]  
-        
+        # Handle machine_id like emeter-312 and emeter-312-2 
+        if machine_id.startswith(("emeter-", "dmeter-", "gmeter-")):
+            # Extract the number part, handling both cases like "312" and "312-2"
+            parts = machine_id.split('-')
+            if len(parts) == 2:  # emeter-312
+                machine_id = parts[1]
+            elif len(parts) == 3:  # emeter-312-2
+                machine_id = f"{parts[1]}-{parts[2]}"
+
         # Construct the entity ID in the desired format: id_0_attribute
         entity_id = f"{machine_id}_0_{attribute}"  # Ex: "312_0_Frequency"
-        
+
         # Only write non-dictionary field values (Phase1Voltage, Frequency ...)
         if isinstance(value, dict):
             print(f"Skipping dictionary field: {attribute}")
@@ -96,4 +101,4 @@ def notify_handler():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host="0.0.0.0", port=5000)  
+    app.run(debug=True, host="0.0.0.0", port=5000)
