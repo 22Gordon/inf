@@ -1,6 +1,7 @@
 from datetime import datetime
 import json
 import os
+import logging
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 from flask import Flask, request
@@ -8,97 +9,118 @@ from flask import Flask, request
 # Initialize Flask app
 app = Flask(__name__)
 
+# Configure logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()  # Set default log level to INFO
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger()
+
 # InfluxDB configuration from environment variables
-token = os.getenv("INFLUXDB_TOKEN", "default-token")  
-org = os.getenv("INFLUXDB_ORG", "default_org")       
-bucket = os.getenv("INFLUXDB_BUCKET", "default_bucket")  
-influx_url = os.getenv("INFLUXDB_URL", "http://localhost:8086")  
+INFLUX_CONFIG = {
+    "token": os.getenv("INFLUXDB_TOKEN", "default-token"),
+    "org": os.getenv("INFLUXDB_ORG", "default_org"),
+    "bucket": os.getenv("INFLUXDB_BUCKET", "default_bucket"),
+    "url": os.getenv("INFLUXDB_URL", "http://localhost:8086"),
+}
 
 # Initialize InfluxDB client
-client = InfluxDBClient(url=influx_url, token=token)
+client = InfluxDBClient(url=INFLUX_CONFIG["url"], token=INFLUX_CONFIG["token"])
 write_api = client.write_api(write_options=SYNCHRONOUS)
 
-# Helper function to write data into InfluxDB
-def write_to_influxdb(machine_id, attribute, value, domain="sensor"):
+
+def extract_machine_id(machine_id):
+    """
+    Extract and format the machine ID.
+    Handles cases like 'emeter-312' and 'emeter-312-2'.
+    """
     try:
-        # Handle machine_id like emeter-312 and emeter-312-2 
         if machine_id.startswith(("emeter-", "dmeter-", "gmeter-")):
-            # Extract the number part, handling both cases like "312" and "312-2"
             parts = machine_id.split('-')
-            if len(parts) == 2:  # emeter-312
-                machine_id = parts[1]
-            elif len(parts) == 3:  # emeter-312-2
-                machine_id = f"{parts[1]}-{parts[2]}"
-
-        # Construct the entity ID in the desired format: id_0_attribute
-        entity_id = f"{machine_id}_0_{attribute}"  # Ex: "312_0_Frequency"
-
-        # Only write non-dictionary field values (Phase1Voltage, Frequency ...)
-        if isinstance(value, dict):
-            print(f"Skipping dictionary field: {attribute}")
-            return  
-
-        # Create points with tags and fields
-        point = Point("sensor_data") \
-            .tag("entity_id", entity_id) \
-            .tag("domain", domain) \
-            .field(attribute, value) \
-            .time(datetime.utcnow(), WritePrecision.NS)
-
-        # Write data to InfluxDB
-        response = write_api.write(bucket, org, point)
-        print(f"Data written to InfluxDB: {entity_id}, {attribute}, {value}")
-        print(f"Write response: {response}")
+            if len(parts) == 2:
+                return parts[1]
+            elif len(parts) == 3:
+                return f"{parts[1]}-{parts[2]}"
+        return machine_id
     except Exception as e:
-        print(f"Error writing data to InfluxDB: {e}")
+        logger.error(f"Error extracting machine ID: {e}")
+        return None
 
-@app.route('/notify', methods=['POST'])
-def notify_handler():
+
+def write_to_influxdb(machine_id, attribute, value, domain="sensor"):
+    """
+    Write a data point to InfluxDB.
+    """
     try:
-        # Log the headers and incoming data
-        fiware_service = request.headers.get('fiware-service')
-        fiware_servicepath = request.headers.get('fiware-servicepath')
-        print(f"Received notification headers:")
-        print(f"fiware-service: {fiware_service}")
-        print(f"fiware-servicepath: {fiware_servicepath}")
+        if isinstance(value, dict):
+            logger.debug(f"Skipping dictionary field: {attribute}")
+            return
 
+        entity_id = f"{machine_id}_0_{attribute}"
+        point = (
+            Point("sensor_data")
+            .tag("entity_id", entity_id)
+            .tag("domain", domain)
+            .field(attribute, value)
+            .time(datetime.utcnow(), WritePrecision.NS)
+        )
+
+        write_api.write(INFLUX_CONFIG["bucket"], INFLUX_CONFIG["org"], point)
+        logger.info(f"Data written to InfluxDB: {entity_id}, {attribute}, {value}")
+    except Exception as e:
+        logger.error(f"Error writing to InfluxDB: {e}")
+
+
+@app.route("/notify", methods=["POST"])
+def notify_handler():
+    """
+    Handle incoming notifications from FIWARE.
+    """
+    try:
+        # Log headers for debugging
+        fiware_service = request.headers.get("fiware-service")
+        fiware_servicepath = request.headers.get("fiware-servicepath")
+        logger.debug(f"Headers - fiware-service: {fiware_service}, fiware-servicepath: {fiware_servicepath}")
+
+        # Validate incoming data
         incoming_data = request.json
         if not incoming_data:
-            print("Error: No data received in the notification")
+            logger.error("No data received in the notification.")
             return "Error: No data received", 400
 
-        print(f"Received notification: {json.dumps(incoming_data, indent=4)}")
+        logger.debug(f"Incoming data: {json.dumps(incoming_data, indent=2)}")
 
-        # Process entities in the notification
+        # Process each entity in the notification
         for entity in incoming_data.get("data", []):
-            machine_id = entity.get('id')  # Extract machine ID
-            print(f"Processing entity: {machine_id}")
+            machine_id = entity.get("id")
+            if not machine_id:
+                logger.warning("Entity without ID found; skipping.")
+                continue
 
-            # Iterate through attributes of the entity
+            machine_id = extract_machine_id(machine_id)
+            if not machine_id:
+                logger.warning("Failed to extract valid machine ID; skipping entity.")
+                continue
+
+            logger.info(f"Processing entity: {machine_id}")
+
+            # Process each attribute in the entity
             for attr, value_data in entity.items():
-                # Skip attributes like 'id', 'type', 'TimeInstant', and 'device_info'
-                if attr in ['id', 'type', 'TimeInstant', 'device_info']:
+                if attr in ["id", "type", "TimeInstant", "device_info"]:
                     continue
 
-                # Ensure value is available and process
-                if isinstance(value_data, dict):
-                    value = value_data.get('value')
-                else:
-                    value = value_data 
-
-                # If valid value, write to InfluxDB
+                value = value_data.get("value") if isinstance(value_data, dict) else value_data
                 if value is not None:
-                    print(f"Writing to InfluxDB: {machine_id}, {attr}, {value}")
+                    logger.debug(f"Writing attribute: {attr} with value: {value}")
                     write_to_influxdb(machine_id, attr, value)
                 else:
-                    print(f"Error: No value found for attribute {attr} in entity {machine_id}")
+                    logger.warning(f"No value found for attribute: {attr}")
 
         return "Notification processed successfully", 200
 
     except Exception as e:
-        print(f"Error processing notification: {e}")
+        logger.error(f"Error processing notification: {e}")
         return "Error processing notification", 500
 
 
-if __name__ == '__main__':
-    app.run(debug=True, host="0.0.0.0", port=5000)
+if __name__ == "__main__":
+    DEBUG = os.getenv("DEBUG", "False").lower() == "true"
+    app.run(debug=DEBUG, host="0.0.0.0", port=5000)
